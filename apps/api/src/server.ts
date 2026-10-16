@@ -235,6 +235,7 @@ async function main() {
         console.error(
           `[4evergent] Shutdown exceeded ${SHUTDOWN_TIMEOUT_MS}ms; forcing exit`
         );
+        server!.server.closeAllConnections?.();
         process.exit(1);
       }, SHUTDOWN_TIMEOUT_MS);
 

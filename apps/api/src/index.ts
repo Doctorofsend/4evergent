@@ -1611,9 +1611,9 @@ export async function createApiServer(options: ServerOptions) {
         clearInterval(retentionTimer);
         retentionTimer = null;
       }
-      // Abort lingering keep-alive connections so the server actually shuts
-      // down (Node's http close() waits for active sockets otherwise).
-      server.closeAllConnections?.();
+      // server.close() stops new connections and lets in-flight requests finish.
+      // The process entry point force-closes remaining sockets only if its
+      // shutdown deadline expires.
       server.close(() => resolve());
     }),
     registerAgent: (agent: Agent) => {
