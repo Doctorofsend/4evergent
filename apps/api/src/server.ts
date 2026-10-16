@@ -34,6 +34,7 @@ import { DevAuthProvider, ProductionApiKeyAuthProvider } from "@4evergent/shared
 import { createAuthModule } from "./auth.js";
 
 const TESTNET_PASSPHRASE = "Test SDF Network ; September 2015";
+const SHUTDOWN_TIMEOUT_MS = 10_000;
 
 function parseApiKeys(envVar: string | undefined): Record<string, { ownerId: string; subject: string }> {
   if (!envVar) return {};
@@ -186,8 +187,9 @@ async function main() {
   console.log(`[4evergent] Database: ${dbPath ?? "in-memory"}`);
   console.log(`[4evergent] Live submission: ${process.env.LIVE_SUBMIT === "1" ? "ENABLED" : "disabled"}`);
 
+  let server: Awaited<ReturnType<typeof createApiServer>> | undefined;
   try {
-    const server = await createApiServer({
+    server = await createApiServer({
       port,
       horizonUrl,
       signer,
@@ -201,8 +203,54 @@ async function main() {
 
     await server.listen(port, host);
     console.log(`[4evergent] Server listening on http://${host}:${port}`);
+
+    let shuttingDown = false;
+    const shutdown = async (signal: string) => {
+      if (shuttingDown) return;
+      shuttingDown = true;
+      console.log(`[4evergent] ${signal} received — shutting down`);
+      console.log(
+        "[4evergent] Stopping worker polling and closing HTTP connections; active work is not awaited and can be recovered on the next startup."
+      );
+
+      const timeout = setTimeout(() => {
+        console.error(
+          `[4evergent] Shutdown exceeded ${SHUTDOWN_TIMEOUT_MS}ms; forcing exit`
+        );
+        process.exit(1);
+      }, SHUTDOWN_TIMEOUT_MS);
+
+      try {
+        await server!.close();
+        clearTimeout(timeout);
+        console.log("[4evergent] Shutdown complete");
+        process.exit(0);
+      } catch (err: any) {
+        clearTimeout(timeout);
+        console.error(`[4evergent] Shutdown failed: ${err.message}`);
+        process.exit(1);
+      }
+    };
+
+    process.once("SIGTERM", () => void shutdown("SIGTERM"));
+    process.once("SIGINT", () => void shutdown("SIGINT"));
   } catch (err: any) {
     console.error(`FATAL: ${err.message}`);
+    if (server) {
+      const timeout = setTimeout(() => {
+        console.error(
+          `[4evergent] Startup cleanup exceeded ${SHUTDOWN_TIMEOUT_MS}ms; forcing exit`
+        );
+        process.exit(1);
+      }, SHUTDOWN_TIMEOUT_MS);
+      try {
+        await server.close();
+        clearTimeout(timeout);
+      } catch (closeErr: any) {
+        clearTimeout(timeout);
+        console.error(`[4evergent] Startup cleanup failed: ${closeErr.message}`);
+      }
+    }
     process.exit(1);
   }
 }
