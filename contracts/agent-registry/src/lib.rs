@@ -5,9 +5,18 @@
 //! - update_metadata(caller, id, new_display_name, new_capabilities)
 //! - deactivate(caller, id)
 //! - query(id)
-//! - authorization: every mutating entrypoint takes the acting `Address` and
+//! - authorization: every *** entrypoint takes the acting `Address` and
 //!   calls `require_auth()` as its first statement; only the registered owner
 //!   may update/deactivate their own agent.
+//!
+//! Agent ids are case-sensitive and are not normalized. They must start with
+//! an ASCII lowercase letter or digit, followed only by ASCII lowercase
+//! letters, digits, `.`, `_`, or `-`. Uppercase and non-ASCII characters are
+//! rejected. The 64-byte limit is measured in UTF-8 bytes (all accepted ids
+//! are ASCII, so this is also their character count).
+//!
+//! Events: each successful mutation publishes a contract event with topics
+//! `("agent", <action>)` — see `DESIGN.md` for the full event schema.
 //!
 //! Lifecycle/TTL model:
 //! - Agent records live in *persistent* storage under `DataKey::Agent(id)`.
@@ -20,6 +29,47 @@
 //!   not deleted. It must be restored (automatic when the transaction is
 //!   simulated via RPC) before it can be read or written, and `register` on
 //!   that id still fails with AlreadyRegistered after restore.
+//!
+//! # Validation rules
+//!
+//! Every input is validated *before* any storage write, so a rejected call
+//! leaves storage completely untouched. The same validators run on both
+//! `register` and `update_metadata` — a caller may not smuggle a record past
+//! the rules by registering a valid one and then updating it.
+//!
+//! | Input | Rule | Rejection |
+//! |---|---|---|
+//! | `id` | non-empty | `Error::IdEmpty` |
+//! | `id` | at most [`MAX_ID_LEN`] (64) bytes | `Error::IdTooLong` |
+//! | `display_name` | non-empty | `Error::DisplayNameEmpty` |
+//! | `display_name` | at most [`MAX_DISPLAY_NAME_LEN`] (128) bytes | `Error::DisplayNameTooLong` |
+//! | `capabilities` | at most [`MAX_CAPABILITIES`] (32) entries | `Error::TooManyCapabilities` |
+//! | each capability | non-empty | `Error::CapabilityEmpty` |
+//! | each capability | at most [`MAX_CAPABILITY_LEN`] (32) bytes | `Error::CapabilityTooLong` |
+//! | each capability | distinct from every other entry | `Error::CapabilityDuplicate` |
+//!
+//! Decisions stated explicitly (each is a deliberate choice, not an accident):
+//!
+//! - **Duplicate capabilities are rejected**, and the comparison is **exact
+//!   byte equality** — case-sensitive and with no trimming. `"Vision"` and
+//!   `"vision"` are therefore two *distinct* capabilities, while `"read"`
+//!   supplied twice is rejected. This is a stricter contract for callers:
+//!   `update_metadata` now rejects a capability list that repeats an entry,
+//!   even if the agent was registered before this rule existed. The check is
+//!   O(n²) over at most 32 entries (≤ 496 comparisons), which is bounded and
+//!   cheap; no allocation is required, which matters because the crate is
+//!   `no_std`.
+//! - **Whitespace-only `display_name` (e.g. `"   "`) is accepted**, and this
+//!   is intentional. `soroban_sdk::String` exposes only `len()` and
+//!   `is_empty()` — there is no byte, char, or slice accessor, and `Display`/
+//!   `ToString` are compiled out for `wasm32` — so a whitespace test cannot be
+//!   expressed in contract code without an extra host round-trip. Only the
+//!   genuinely-empty string is rejected. Revisit if the SDK grows a byte
+//!   accessor.
+//! - **Precedence** when an input violates several rules at once: the entry
+//!   count is checked first (`TooManyCapabilities`), then each capability is
+//!   examined in order and the first violation wins, in the order
+//!   `CapabilityEmpty` → `CapabilityTooLong` → `CapabilityDuplicate`.
 //!
 //! Future: delegation, multi-sig registration, capability discovery events.
 
@@ -73,6 +123,15 @@ pub enum Error {
     DisplayNameTooLong = 7,
     TooManyCapabilities = 8,
     CapabilityTooLong = 9,
+    InvalidIdChar = 10,
+    /// `display_name` was empty (`len() == 0`).
+    DisplayNameEmpty = 11,
+    /// A capability entry was empty (`len() == 0`).
+    CapabilityEmpty = 12,
+    /// The same capability string appeared more than once in one list.
+    /// Comparison is exact byte equality (case-sensitive, no trimming) — see
+    /// the module-level "Validation rules" section.
+    CapabilityDuplicate = 13,
 }
 
 #[contract]
@@ -85,23 +144,63 @@ fn validate_id(id: &String) -> Result<(), Error> {
     if id.len() > MAX_ID_LEN {
         return Err(Error::IdTooLong);
     }
+    // soroban-sdk 22 exposes String::copy_into_slice (rather than to_bytes).
+    // The length check above bounds this stack buffer to MAX_ID_LEN bytes.
+    let len = id.len() as usize;
+    let mut bytes = [0u8; MAX_ID_LEN as usize];
+    id.copy_into_slice(&mut bytes[..len]);
+    for (index, byte) in bytes[..len].iter().enumerate() {
+        let lowercase = (b'a'..=b'z').contains(&byte);
+        let digit = (b'0'..=b'9').contains(&byte);
+        let allowed_punctuation = matches!(byte, b'.' | b'_' | b'-');
+        if (index == 0 && !lowercase && !digit)
+            || (index > 0 && !lowercase && !digit && !allowed_punctuation)
+        {
+            return Err(Error::InvalidIdChar);
+        }
+    }
     Ok(())
 }
 
+/// Reject an empty `display_name` or one longer than `MAX_DISPLAY_NAME_LEN`.
+/// Whitespace-only names are accepted on purpose (documented in the module
+/// docs): `soroban_sdk::String` has no byte/char accessor, so the check is not
+/// expressible on-chain.
 fn validate_display_name(name: &String) -> Result<(), Error> {
+    if name.is_empty() {
+        return Err(Error::DisplayNameEmpty);
+    }
     if name.len() > MAX_DISPLAY_NAME_LEN {
         return Err(Error::DisplayNameTooLong);
     }
     Ok(())
 }
 
+/// Reject a capability list that is too large, or that contains an empty,
+/// over-long, or duplicated entry. Duplicates are compared by exact byte
+/// equality (case-sensitive, no trimming) — see the module docs.
+///
+/// Order of checks: the entry count first, then each entry left to right with
+/// the first violation winning (`CapabilityEmpty`, `CapabilityTooLong`, then
+/// `CapabilityDuplicate`).
 fn validate_capabilities(caps: &Vec<String>) -> Result<(), Error> {
     if caps.len() > MAX_CAPABILITIES {
         return Err(Error::TooManyCapabilities);
     }
-    for cap in caps.iter() {
+    for i in 0..caps.len() {
+        let cap = caps.get_unchecked(i);
+        if cap.is_empty() {
+            return Err(Error::CapabilityEmpty);
+        }
         if cap.len() > MAX_CAPABILITY_LEN {
             return Err(Error::CapabilityTooLong);
+        }
+        // O(n^2) with n <= MAX_CAPABILITIES: bounded, allocation-free, which
+        // keeps this usable in a `no_std` contract.
+        for j in 0..i {
+            if caps.get_unchecked(j) == cap {
+                return Err(Error::CapabilityDuplicate);
+            }
         }
     }
     Ok(())
@@ -146,7 +245,7 @@ impl AgentRegistry {
         let now = env.ledger().timestamp();
         let info = AgentInfo {
             id: id.clone(),
-            owner: caller,
+            owner: caller.clone(),
             display_name,
             stellar_address,
             capabilities,
@@ -156,6 +255,13 @@ impl AgentRegistry {
         };
         env.storage().persistent().set(&key, &info);
         bump_ttl(&env, &key);
+        env.events().publish(
+            (
+                String::from_str(&env, "agent"),
+                String::from_str(&env, "registered"),
+            ),
+            (id, caller, info.stellar_address.clone()),
+        );
         Ok(info)
     }
 
@@ -169,7 +275,7 @@ impl AgentRegistry {
         new_capabilities: Vec<String>,
     ) -> Result<AgentInfo, Error> {
         caller.require_auth();
-        let key = DataKey::Agent(id);
+        let key = DataKey::Agent(id.clone());
         let mut info: AgentInfo = env
             .storage()
             .persistent()
@@ -188,6 +294,13 @@ impl AgentRegistry {
         info.updated_at = env.ledger().timestamp();
         env.storage().persistent().set(&key, &info);
         bump_ttl(&env, &key);
+        env.events().publish(
+            (
+                String::from_str(&env, "agent"),
+                String::from_str(&env, "updated"),
+            ),
+            (id, caller),
+        );
         Ok(info)
     }
 
@@ -196,7 +309,7 @@ impl AgentRegistry {
     /// and there is no reactivation entrypoint. Only the registered owner.
     pub fn deactivate(env: Env, caller: Address, id: String) -> Result<bool, Error> {
         caller.require_auth();
-        let key = DataKey::Agent(id);
+        let key = DataKey::Agent(id.clone());
         let mut info: AgentInfo = env
             .storage()
             .persistent()
@@ -209,6 +322,13 @@ impl AgentRegistry {
         info.updated_at = env.ledger().timestamp();
         env.storage().persistent().set(&key, &info);
         bump_ttl(&env, &key);
+        env.events().publish(
+            (
+                String::from_str(&env, "agent"),
+                String::from_str(&env, "deactivated"),
+            ),
+            (id, caller),
+        );
         Ok(true)
     }
 
@@ -229,10 +349,10 @@ mod test {
     use super::*;
     use soroban_sdk::{
         testutils::{
-            storage::Instance as _, storage::Persistent as _, Address as _, Ledger as _, MockAuth,
-            MockAuthInvoke,
+            storage::Instance as _, storage::Persistent as _, Address as _, Events as _,
+            Ledger as _, MockAuth, MockAuthInvoke,
         },
-        vec, IntoVal, Val,
+        vec, IntoVal, TryIntoVal, Val,
     };
     use std::println;
 
@@ -496,6 +616,37 @@ mod test {
     }
 
     #[test]
+    fn test_id_charset_is_ascii_lowercase_and_case_sensitive() {
+        let (env, _cid, client) = setup();
+        env.mock_all_auths();
+        let owner = Address::generate(&env);
+
+        for invalid in [
+            "Agent_1", "agent 1", "agent\n1", "agenté", ".agent", "_agent", "-agent",
+        ] {
+            let id = String::from_str(&env, invalid);
+            let res = client.try_register(
+                &owner,
+                &id,
+                &String::from_str(&env, "A"),
+                &owner,
+                &Vec::new(&env),
+            );
+            assert_eq!(want_err(res), Error::InvalidIdChar, "id: {invalid:?}");
+        }
+
+        let valid = String::from_str(&env, "agent_1.v2-test");
+        client.register(
+            &owner,
+            &valid,
+            &String::from_str(&env, "A"),
+            &owner,
+            &Vec::new(&env),
+        );
+        assert_eq!(client.query(&valid).unwrap().id, valid);
+    }
+
+    #[test]
     fn test_unknown_id_errors() {
         let (env, _cid, client) = setup();
         env.mock_all_auths();
@@ -696,8 +847,13 @@ mod test {
         env.mock_all_auths();
         let owner = Address::generate(&env);
         let mut caps = Vec::new(&env);
-        for _ in 0..32 {
-            caps.push_back(String::from_str(&env, "c"));
+        // 32 DISTINCT entries, each exactly 32 bytes: exercises the entry-count
+        // cap, the per-entry length cap, and the duplicate rule all at once.
+        // (These must be distinct now that duplicates are rejected.)
+        for i in 0..32u32 {
+            let cap = std::format!("{:0>32}", i);
+            assert_eq!(cap.len(), 32);
+            caps.push_back(String::from_str(&env, &cap));
         }
         let info = client.register(
             &owner,
@@ -708,6 +864,216 @@ mod test {
         );
         assert_eq!(info.capabilities.len(), 32);
         assert_eq!(info.display_name.len(), 128);
+        // And the same at-limit list is accepted on update_metadata too.
+        let updated = client.update_metadata(
+            &owner,
+            &String::from_str(&env, "limits_ok"),
+            &String::from_str(&env, &"e".repeat(128)),
+            &caps,
+        );
+        assert_eq!(updated.display_name.len(), 128);
+        assert_eq!(updated.capabilities.len(), 32);
+    }
+
+    // ---- lower-bound / uniqueness validation (empty + duplicate rules) ----
+
+    // An empty display_name is rejected on register, and storage stays empty.
+    #[test]
+    fn test_empty_display_name_rejected_on_register() {
+        let (env, _cid, client) = setup();
+        env.mock_all_auths();
+        let owner = Address::generate(&env);
+        let id = String::from_str(&env, "empty_name");
+
+        let res = client.try_register(
+            &owner,
+            &id,
+            &String::from_str(&env, ""),
+            &owner,
+            &Vec::new(&env),
+        );
+        assert_eq!(want_err(res), Error::DisplayNameEmpty);
+        assert!(
+            client.query(&id).is_none(),
+            "a rejected register must leave no record"
+        );
+    }
+
+    // An empty display_name is rejected on update_metadata, leaving state intact.
+    #[test]
+    fn test_empty_display_name_rejected_on_update() {
+        let (env, _cid, client) = setup();
+        env.mock_all_auths();
+        let owner = Address::generate(&env);
+        let id = String::from_str(&env, "a1");
+        register(&env, &client, &owner, &id, "A");
+
+        let res =
+            client.try_update_metadata(&owner, &id, &String::from_str(&env, ""), &Vec::new(&env));
+        assert_eq!(want_err(res), Error::DisplayNameEmpty);
+
+        // State untouched.
+        let info = client.query(&id).unwrap();
+        assert_eq!(info.display_name, String::from_str(&env, "A"));
+    }
+
+    // An empty capability string is rejected on register.
+    #[test]
+    fn test_empty_capability_rejected_on_register() {
+        let (env, _cid, client) = setup();
+        env.mock_all_auths();
+        let owner = Address::generate(&env);
+        let id = String::from_str(&env, "empty_cap");
+
+        let mut caps = Vec::new(&env);
+        caps.push_back(String::from_str(&env, "read"));
+        caps.push_back(String::from_str(&env, ""));
+        let res = client.try_register(&owner, &id, &String::from_str(&env, "A"), &owner, &caps);
+        assert_eq!(want_err(res), Error::CapabilityEmpty);
+        assert!(client.query(&id).is_none());
+    }
+
+    // An empty capability string is rejected on update_metadata, state intact.
+    #[test]
+    fn test_empty_capability_rejected_on_update() {
+        let (env, _cid, client) = setup();
+        env.mock_all_auths();
+        let owner = Address::generate(&env);
+        let id = String::from_str(&env, "a1");
+        register(&env, &client, &owner, &id, "A");
+
+        let mut caps = Vec::new(&env);
+        caps.push_back(String::from_str(&env, ""));
+        let res = client.try_update_metadata(&owner, &id, &String::from_str(&env, "B"), &caps);
+        assert_eq!(want_err(res), Error::CapabilityEmpty);
+
+        let info = client.query(&id).unwrap();
+        assert_eq!(info.display_name, String::from_str(&env, "A"));
+        assert_eq!(info.capabilities.len(), 0);
+    }
+
+    // A repeated capability is rejected on register.
+    #[test]
+    fn test_duplicate_capability_rejected_on_register() {
+        let (env, _cid, client) = setup();
+        env.mock_all_auths();
+        let owner = Address::generate(&env);
+        let id = String::from_str(&env, "dup_cap");
+
+        let mut caps = Vec::new(&env);
+        caps.push_back(String::from_str(&env, "read"));
+        caps.push_back(String::from_str(&env, "write"));
+        caps.push_back(String::from_str(&env, "read"));
+        let res = client.try_register(&owner, &id, &String::from_str(&env, "A"), &owner, &caps);
+        assert_eq!(want_err(res), Error::CapabilityDuplicate);
+        assert!(client.query(&id).is_none());
+    }
+
+    // A repeated capability is rejected on update_metadata, state intact.
+    #[test]
+    fn test_duplicate_capability_rejected_on_update() {
+        let (env, _cid, client) = setup();
+        env.mock_all_auths();
+        let owner = Address::generate(&env);
+        let id = String::from_str(&env, "a1");
+        register(&env, &client, &owner, &id, "A");
+
+        let mut caps = Vec::new(&env);
+        caps.push_back(String::from_str(&env, "read"));
+        caps.push_back(String::from_str(&env, "read"));
+        let res = client.try_update_metadata(&owner, &id, &String::from_str(&env, "B"), &caps);
+        assert_eq!(want_err(res), Error::CapabilityDuplicate);
+
+        let info = client.query(&id).unwrap();
+        assert_eq!(info.display_name, String::from_str(&env, "A"));
+        assert_eq!(info.capabilities.len(), 0);
+    }
+
+    // Duplicate detection is EXACT byte equality: differently-cased entries are
+    // distinct and therefore accepted. This pins the documented comparison rule.
+    #[test]
+    fn test_case_folded_capabilities_are_distinct() {
+        let (env, _cid, client) = setup();
+        env.mock_all_auths();
+        let owner = Address::generate(&env);
+        let id = String::from_str(&env, "case_caps");
+
+        let mut caps = Vec::new(&env);
+        caps.push_back(String::from_str(&env, "Vision"));
+        caps.push_back(String::from_str(&env, "vision"));
+        let info = client.register(&owner, &id, &String::from_str(&env, "A"), &owner, &caps);
+        assert_eq!(info.capabilities.len(), 2);
+    }
+
+    // Documented decision: whitespace-only display_name is ACCEPTED (the SDK
+    // gives no byte/char accessor, so it cannot be rejected on-chain). This test
+    // makes the decision executable; update it deliberately if that ever changes.
+    #[test]
+    fn test_whitespace_only_display_name_accepted_by_design() {
+        let (env, _cid, client) = setup();
+        env.mock_all_auths();
+        let owner = Address::generate(&env);
+        let id = String::from_str(&env, "ws_name");
+
+        let info = client.register(
+            &owner,
+            &id,
+            &String::from_str(&env, "   "),
+            &owner,
+            &Vec::new(&env),
+        );
+        assert_eq!(info.display_name, String::from_str(&env, "   "));
+    }
+
+    // Precedence: an over-long list is rejected before per-entry rules, and an
+    // empty entry is reported before a duplicate one.
+    #[test]
+    fn test_capability_validation_precedence() {
+        let (env, _cid, client) = setup();
+        env.mock_all_auths();
+        let owner = Address::generate(&env);
+
+        // 33 empty entries: the count cap wins over CapabilityEmpty.
+        let mut caps = Vec::new(&env);
+        for _ in 0..33 {
+            caps.push_back(String::from_str(&env, ""));
+        }
+        let res = client.try_register(
+            &owner,
+            &String::from_str(&env, "many_empty"),
+            &String::from_str(&env, "A"),
+            &owner,
+            &caps,
+        );
+        assert_eq!(want_err(res), Error::TooManyCapabilities);
+
+        // The first entry's empty-string violation is reported before the
+        // later duplicate.
+        let mut caps = Vec::new(&env);
+        caps.push_back(String::from_str(&env, ""));
+        caps.push_back(String::from_str(&env, ""));
+        let res = client.try_register(
+            &owner,
+            &String::from_str(&env, "empty_then_dup"),
+            &String::from_str(&env, "A"),
+            &owner,
+            &caps,
+        );
+        assert_eq!(want_err(res), Error::CapabilityEmpty);
+
+        // An over-long entry is reported before a duplicate of it.
+        let oversized = "c".repeat(33);
+        let mut caps = Vec::new(&env);
+        caps.push_back(String::from_str(&env, &oversized));
+        caps.push_back(String::from_str(&env, &oversized));
+        let res = client.try_register(
+            &owner,
+            &String::from_str(&env, "long_then_dup"),
+            &String::from_str(&env, "A"),
+            &owner,
+            &caps,
+        );
+        assert_eq!(want_err(res), Error::CapabilityTooLong);
     }
 
     // F1: write paths extend the contract INSTANCE ttl — not only the entry.
@@ -832,5 +1198,151 @@ mod test {
             inst_before, inst_after,
             "query must not mutate the contract instance TTL"
         );
+    }
+
+    // ---- event emission tests ----
+
+    /// Captures contract events published during execution of `f`.
+    fn capture_events<F>(env: &Env, f: F) -> Vec<(Address, Vec<Val>, Val)>
+    where
+        F: FnOnce(),
+    {
+        f();
+        env.events().all()
+    }
+
+    #[test]
+    fn test_register_emits_event() {
+        let (env, _cid, client) = setup();
+        env.mock_all_auths();
+        let owner = Address::generate(&env);
+        let stellar_addr = Address::generate(&env);
+        let id = String::from_str(&env, "agent_1");
+
+        let events = capture_events(&env, || {
+            client.register(
+                &owner,
+                &id,
+                &String::from_str(&env, "Test Agent"),
+                &stellar_addr,
+                &Vec::new(&env),
+            );
+        });
+
+        assert_eq!(events.len(), 1, "register should emit exactly one event");
+        let (_, topics, data) = events.get(0).unwrap();
+        assert_eq!(topics.len(), 2);
+        let t0: String = topics.get(0).unwrap().clone().try_into_val(&env).unwrap();
+        let t1: String = topics.get(1).unwrap().clone().try_into_val(&env).unwrap();
+        assert_eq!(t0, String::from_str(&env, "agent"));
+        assert_eq!(t1, String::from_str(&env, "registered"));
+
+        let payload: (String, Address, Address) = data.clone().try_into_val(&env).unwrap();
+        assert_eq!(payload.0, id);
+        assert_eq!(payload.1, owner);
+    }
+
+    #[test]
+    fn test_update_metadata_emits_event() {
+        let (env, _cid, client) = setup();
+        env.mock_all_auths();
+        let owner = Address::generate(&env);
+        let id = String::from_str(&env, "agent_1");
+        register(&env, &client, &owner, &id, "Original");
+
+        let events = capture_events(&env, || {
+            client.update_metadata(
+                &owner,
+                &id,
+                &String::from_str(&env, "Updated"),
+                &Vec::new(&env),
+            );
+        });
+
+        assert_eq!(
+            events.len(),
+            1,
+            "update_metadata should emit exactly one event"
+        );
+        let (_, topics, data) = events.get(0).unwrap();
+        assert_eq!(topics.len(), 2);
+        let t0: String = topics.get(0).unwrap().clone().try_into_val(&env).unwrap();
+        let t1: String = topics.get(1).unwrap().clone().try_into_val(&env).unwrap();
+        assert_eq!(t0, String::from_str(&env, "agent"));
+        assert_eq!(t1, String::from_str(&env, "updated"));
+
+        let payload: (String, Address) = data.clone().try_into_val(&env).unwrap();
+        assert_eq!(payload.0, id);
+        assert_eq!(payload.1, owner);
+    }
+
+    #[test]
+    fn test_deactivate_emits_event() {
+        let (env, _cid, client) = setup();
+        env.mock_all_auths();
+        let owner = Address::generate(&env);
+        let id = String::from_str(&env, "agent_1");
+        register(&env, &client, &owner, &id, "Test");
+
+        let events = capture_events(&env, || {
+            client.deactivate(&owner, &id);
+        });
+
+        assert_eq!(events.len(), 1, "deactivate should emit exactly one event");
+        let (_, topics, data) = events.get(0).unwrap();
+        assert_eq!(topics.len(), 2);
+        let t0: String = topics.get(0).unwrap().clone().try_into_val(&env).unwrap();
+        let t1: String = topics.get(1).unwrap().clone().try_into_val(&env).unwrap();
+        assert_eq!(t0, String::from_str(&env, "agent"));
+        assert_eq!(t1, String::from_str(&env, "deactivated"));
+
+        let payload: (String, Address) = data.clone().try_into_val(&env).unwrap();
+        assert_eq!(payload.0, id);
+        assert_eq!(payload.1, owner);
+    }
+
+    #[test]
+    fn test_failed_register_emits_no_event() {
+        let (env, _cid, client) = setup();
+        env.mock_all_auths();
+        let owner = Address::generate(&env);
+        let id = String::from_str(&env, "agent_1");
+        register(&env, &client, &owner, &id, "A");
+
+        let events = capture_events(&env, || {
+            let res = client.try_register(
+                &owner,
+                &id,
+                &String::from_str(&env, "B"),
+                &owner,
+                &Vec::new(&env),
+            );
+            assert!(res.is_err());
+        });
+
+        assert!(events.is_empty(), "failed register must not emit an event");
+    }
+
+    #[test]
+    fn test_failed_update_emits_no_event() {
+        let (env, _cid, client) = setup();
+        env.mock_all_auths();
+        let owner = Address::generate(&env);
+        let stranger = Address::generate(&env);
+        let id = String::from_str(&env, "agent_1");
+        register(&env, &client, &owner, &id, "A");
+
+        env.set_auths(&[]);
+        let events = capture_events(&env, || {
+            let res = client.try_update_metadata(
+                &stranger,
+                &id,
+                &String::from_str(&env, "Hacked"),
+                &Vec::new(&env),
+            );
+            assert!(res.is_err());
+        });
+
+        assert!(events.is_empty(), "failed update must not emit an event");
     }
 }
